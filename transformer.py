@@ -68,6 +68,7 @@ class Transformer_VM(torch.nn.Module):
         d_ff,
         num_classes,
         num_layers,
+        dropout=0.1,
     ):
         super().__init__()
         if image_size % patch_size != 0:
@@ -85,7 +86,7 @@ class Transformer_VM(torch.nn.Module):
             torch.nn.init.trunc_normal_(torch.empty(1, 1, d_model))
         )
         self.transformer_blocks = torch.nn.ModuleList(
-            [TransformerBlock(d_model, num_heads, d_ff) for _ in range(num_layers)]
+            [TransformerBlock(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)]
         )
         self.layernorm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, num_classes)

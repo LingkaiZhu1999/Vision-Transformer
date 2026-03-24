@@ -22,7 +22,6 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
-import torch._dynamo
 
 import webdataset as wds
 import wandb
@@ -40,11 +39,6 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='ViT')
 parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
                     help='path to dataset (default: imagenet)')
-# parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
-#                     choices=model_names,
-#                     help='model architecture: ' +
-#                         ' | '.join(model_names) +
-#                         ' (default: resnet18)')
 parser.add_argument("--image_size", type=int, default=224)
 parser.add_argument("--patch_size", type=int, default=16)
 parser.add_argument("--in_channels", type=int, default=3)
@@ -77,6 +71,8 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--wd', '--weight-decay', default=0.1, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
+parser.add_argument('--dropout', default=0.0, type=float, metavar='D',
+                    help='dropout rate (default: 0.0)')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -195,12 +191,11 @@ def main_worker(gpu, ngpus_per_node, args):
             run = None
     # create model
     if args.pretrained:
-        print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](pretrained=True)
+        import transformers
+        print("=> using pre-trained model 'google/vit-base-patch16-224-in21k'")
+        model = transformers.ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k')
     else:
-        # print("=> creating model '{}'".format(args.arch))
         print("=> creating Vision Transformer model")
-        # model = models.__dict__[args.arch]()
         model = Transformer_VM(
             image_size=args.image_size,
             patch_size=args.patch_size,
@@ -209,11 +204,10 @@ def main_worker(gpu, ngpus_per_node, args):
             num_heads=args.num_heads,
             d_ff=args.d_ff,
             num_classes=args.num_classes,
-            num_layers=args.num_layers
+            num_layers=args.num_layers,
+            dropout=args.dropout
         )
 
-    # model = model.to(memory_format=torch.channels_last)
-    
     if args.compile:
         print("compiling the model with torch.compile...")
         model = torch.compile(model)
@@ -241,11 +235,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 model = torch.nn.parallel.DistributedDataParallel(model)
     elif device.type == 'cuda':
         # DataParallel will divide and allocate batch_size to all available GPUs
-        if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-            model.features = torch.nn.DataParallel(model.features)
-            model.cuda()
-        else:
-            model = torch.nn.DataParallel(model).cuda()
+        model = torch.nn.DataParallel(model).cuda()
     else:
         model.to(device)
 
@@ -257,9 +247,6 @@ def main_worker(gpu, ngpus_per_node, args):
     #                             momentum=args.momentum,
     #                             weight_decay=args.weight_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    # scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
     
     # optionally resume from a checkpoint
     if args.resume:
@@ -369,7 +356,7 @@ def main_worker(gpu, ngpus_per_node, args):
         #     train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        loss, train_acc1, train_acc5 = train(train_loader, model, criterion, optimizer, epoch, device, args)
+        loss, train_acc1, train_acc5, current_lr = train(train_loader, model, criterion, optimizer, epoch, device, args)
         # evaluate on validation set
         acc1, acc5 = validate(val_loader, model, criterion, args)
         if run is not None:
@@ -377,9 +364,10 @@ def main_worker(gpu, ngpus_per_node, args):
                 "train/loss": float(loss), 
                 "train/acc1": float(train_acc1), 
                 "train/acc5": float(train_acc5),
+                "train/lr": float(current_lr),
                 "val/acc1": float(acc1), 
                 "val/acc5": float(acc5),
-                "epoch": epoch
+                "epoch": epoch,
             })
 
         # scheduler.step()
@@ -447,8 +435,6 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         else:
             output = model(images)
             loss = criterion(output, target)
-        # output = model(images)
-        loss = criterion(output, target)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -468,9 +454,8 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
-    return losses.avg, top1.avg, top5.avg
+    return losses.avg, top1.avg, top5.avg, current_lr
 
-@torch._dynamo.disable
 def validate(val_loader, model, criterion, args):
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
