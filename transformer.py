@@ -3,25 +3,22 @@ from einops import rearrange, repeat
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SwiGLU(torch.nn.Module):
-    def __init__(self, d_model, dff, device=None, dtype=None):
+class MLP(torch.nn.Module):
+    def __init__(self, d_model, dff, dropout=0.1):
         super().__init__()
-        self.d_model = d_model
-        self.dff = dff
         self.linear1 = nn.Linear(d_model, dff)
         self.linear2 = nn.Linear(dff, d_model)
-        self.linear3 = nn.Linear(d_model, dff)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        x1 = self.linear1(x)
-        x1 = x1 * torch.sigmoid(x1)
-        x2 = self.linear3(x)
-        x3 = x1 * x2
-        x3 = self.linear2(x3)
-        return x3
+        x = self.dropout(self.activation(self.linear1(x)))
+        x = self.dropout(self.linear2(x))
+        return x
+
 
 class MultiheadSelfAttention(torch.nn.Module):
-    def __init__(self, d_model: int, num_heads: int):
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
@@ -33,28 +30,31 @@ class MultiheadSelfAttention(torch.nn.Module):
         self.k_proj = nn.Linear(d_model, num_heads * self.d_k)
         self.v_proj = nn.Linear(d_model, num_heads * self.d_v)
         self.o_proj = nn.Linear(d_model, num_heads * self.d_v)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         Q = rearrange(self.q_proj(x), "... seq (num_heads d_q) -> ... num_heads seq d_q", num_heads=self.num_heads)
         K = rearrange(self.k_proj(x), "... seq (num_heads d_k) -> ... num_heads seq d_k", num_heads=self.num_heads)
         V = rearrange(self.v_proj(x), "... seq (num_heads d_v) -> ... num_heads seq d_v", num_heads=self.num_heads)
-        attention = F.scaled_dot_product_attention(Q, K, V, is_causal=False)
+        attention = F.scaled_dot_product_attention(Q, K, V, is_causal=False,
+        dropout_p=self.dropout_rate if self.training else 0.0)
         attention = rearrange(attention, "... num_heads seq d_v -> ... seq (num_heads d_v)")
         output = self.o_proj(attention)
         return output
     
 
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, d_model, num_heads, d_ff):
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
         super().__init__()
-        self.rmsnorm1 = nn.RMSNorm(d_model)
-        self.rmsnorm2 = nn.RMSNorm(d_model)
-        self.multihead_self_att = MultiheadSelfAttention(d_model, num_heads)
-        self.swiglu = SwiGLU(d_model, d_ff)
+        self.layernorm1 = nn.LayerNorm(d_model)
+        self.layernorm2 = nn.LayerNorm(d_model)
+        self.multihead_self_att = MultiheadSelfAttention(d_model, num_heads, dropout)
+        self.mlp = MLP(d_model, d_ff, dropout)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        x = x + self.multihead_self_att(self.rmsnorm1(x))
-        x = x + self.swiglu(self.rmsnorm2(x))
+        x = x + self.dropout(self.multihead_self_att(self.layernorm1(x)))
+        x = x + self.mlp(self.layernorm2(x))
         return x
 
 class Transformer_VM(torch.nn.Module):
@@ -87,8 +87,9 @@ class Transformer_VM(torch.nn.Module):
         self.transformer_blocks = torch.nn.ModuleList(
             [TransformerBlock(d_model, num_heads, d_ff) for _ in range(num_layers)]
         )
-        self.rmsnorm = nn.RMSNorm(d_model)
+        self.layernorm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, num_classes)
+        self.dropout = nn.Dropout(0.1)
 
 
     def forward(self, x):
@@ -107,11 +108,12 @@ class Transformer_VM(torch.nn.Module):
         cls_tokens = repeat(self.class_token, "1 1 d -> b 1 d", b=batch_size)
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.positional_encoding[:, :x.shape[1]]
+        x = self.dropout(x)
 
         for transformer_block in self.transformer_blocks:
             x = transformer_block(x)
 
-        x = self.rmsnorm(x)
+        x = self.layernorm(x)
         cls_rep = x[:, 0]
         logits = self.head(cls_rep)
         return logits
