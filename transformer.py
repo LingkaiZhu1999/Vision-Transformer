@@ -30,7 +30,7 @@ class MultiheadSelfAttention(torch.nn.Module):
         self.k_proj = nn.Linear(d_model, num_heads * self.d_k)
         self.v_proj = nn.Linear(d_model, num_heads * self.d_v)
         self.o_proj = nn.Linear(d_model, num_heads * self.d_v)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_rate = dropout
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         Q = rearrange(self.q_proj(x), "... seq (num_heads d_q) -> ... num_heads seq d_q", num_heads=self.num_heads)
@@ -120,10 +120,10 @@ class Transformer_VM(torch.nn.Module):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    x = torch.randn(8, 3, 32, 32, device=device)
+    x = torch.randn(8, 3, 224, 224, device=device)
     transformer = Transformer_VM(
-        image_size=32,
-        patch_size=4,
+        image_size=224,
+        patch_size=16,
         in_channels=3,
         d_model=128,
         num_heads=8,
