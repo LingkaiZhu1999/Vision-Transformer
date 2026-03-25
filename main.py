@@ -22,6 +22,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
+from torch.distributed.optim import ZeroRedundancyOptimizer
 
 import webdataset as wds
 import wandb
@@ -103,6 +104,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
 parser.add_argument('--compile', action='store_true', help="use torch.compile to compile the model")
 parser.add_argument('--bf16', action='store_true', help="use bfloat16 precision for training")
+parser.add_argument('--use_zero', action='store_true', help="use zero optimizer from deepspeed")
 
 best_acc1 = 0
 
@@ -160,6 +162,10 @@ def main():
 def label_to_index(label):
     return int(label) 
 
+def print_peak_memory(prefix, device):
+    if device == 0:
+        print(f"{prefix}: {torch.cuda.max_memory_allocated(device) // 1e6}MB ")
+
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
@@ -207,6 +213,7 @@ def main_worker(gpu, ngpus_per_node, args):
             num_layers=args.num_layers,
             dropout=args.dropout
         )
+    print_peak_memory("Max memory allocated after creating local model", device)
 
     if args.compile:
         print("compiling the model with torch.compile...")
@@ -239,6 +246,8 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model.to(device)
 
+    print_peak_memory("Max memory allocated after creating DDP", device)
+
 
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
@@ -246,7 +255,13 @@ def main_worker(gpu, ngpus_per_node, args):
     # optimizer = torch.optim.SGD(model.parameters(), args.lr,
     #                             momentum=args.momentum,
     #                             weight_decay=args.weight_decay)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.use_zero:
+        optimizer = ZeroRedundancyOptimizer(model.parameters(), 
+                    optimizer_class=torch.optim.AdamW, 
+                    lr=args.lr, 
+                    weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     
     # optionally resume from a checkpoint
     if args.resume:
@@ -446,7 +461,9 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        print_peak_memory("Max memory allocated before optimizer step()", device)
         optimizer.step()
+        print_peak_memory("Max memory allocated after optimizer step()", device)
 
         # measure elapsed time
         batch_time.update(time.time() - end)
