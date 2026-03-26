@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --time=60:00:00
-#SBATCH --mem=80G
-#SBATCH --cpus-per-gpu=20
-#SBATCH --gpus=4
+#SBATCH --mem=180G
+#SBATCH --cpus-per-gpu=40
+#SBATCH --gpus=2
 #SBATCH --ntasks-per-node=1  # <--- Ensures 1 Python command is run per node
 #SBATCH --partition=gpu-h200-141g-ellis
 
@@ -27,4 +27,5 @@ srun python main.py \
   --rank $SLURM_NODEID \
   --dist-backend 'nccl' \
   --compile \
-  --bf16
+  --bf16 \
+  --use_zero
