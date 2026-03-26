@@ -192,7 +192,7 @@ def main_worker(gpu, ngpus_per_node, args):
         is_main_process = not args.distributed or (args.distributed and args.rank == 0)
     
         if is_main_process:
-            run = wandb.init(project="imagenet", config=args)
+            run = wandb.init(project="ViT", config=args)
         else:
             run = None
     # create model
@@ -391,15 +391,27 @@ def main_worker(gpu, ngpus_per_node, args):
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer' : optimizer.state_dict(),
-                # 'scheduler' : scheduler.state_dict()
-            }, is_best)
+        # Fix for ZeroRedundancyOptimizer: consolidate state on all ranks, save only on rank 0
+        if args.use_zero and args.distributed:
+            optimizer.consolidate_state_dict(to=0)
+            if args.rank == 0:
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'best_acc1': best_acc1,
+                    'optimizer': optimizer.state_dict(),
+                    # 'scheduler': scheduler.state_dict()
+                }, is_best)
+        else:
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'best_acc1': best_acc1,
+                    'optimizer': optimizer.state_dict(),
+                    # 'scheduler': scheduler.state_dict()
+                }, is_best)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
