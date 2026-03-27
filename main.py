@@ -20,6 +20,7 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -74,6 +75,22 @@ parser.add_argument('--wd', '--weight-decay', default=0.1, type=float,
                     dest='weight_decay')
 parser.add_argument('--dropout', default=0.0, type=float, metavar='D',
                     help='dropout rate (default: 0.0)')
+parser.add_argument('--randaugment-num-ops', default=2, type=int,
+                    help='number of RandAugment ops to apply per image')
+parser.add_argument('--randaugment-magnitude', default=9, type=int,
+                    help='RandAugment magnitude')
+parser.add_argument('--color-jitter', default=0.4, type=float,
+                    help='strength for ColorJitter augmentation')
+parser.add_argument('--random-erase-prob', default=0.25, type=float,
+                    help='probability for RandomErasing')
+parser.add_argument('--mixup-alpha', default=0.8, type=float,
+                    help='mixup beta distribution alpha; set 0 to disable')
+parser.add_argument('--cutmix-alpha', default=1.0, type=float,
+                    help='cutmix beta distribution alpha; set 0 to disable')
+parser.add_argument('--mixup-prob', default=1.0, type=float,
+                    help='probability of applying mixup/cutmix to a batch')
+parser.add_argument('--switch-prob', default=0.5, type=float,
+                    help='probability of switching from mixup to cutmix when both are enabled')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -107,11 +124,12 @@ parser.add_argument('--bf16', action='store_true', help="use bfloat16 precision 
 parser.add_argument('--use_zero', action='store_true', help="use zero optimizer from deepspeed")
 
 best_acc1 = 0
+IMAGENET_TRAIN_SAMPLES = 1281167
+IMAGENET_VAL_SAMPLES = 50000
 
 
 def main():
     args = parser.parse_args()
-    args.t_cos_anneal = args.epochs * (1281167 // args.batch_size) - args.t_warm_up
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -131,6 +149,17 @@ def main():
         args.world_size = int(os.environ["WORLD_SIZE"])
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+
+    if args.multiprocessing_distributed:
+        effective_world_size = torch.accelerator.device_count() * args.world_size
+    elif args.distributed and args.world_size > 0:
+        effective_world_size = args.world_size
+    else:
+        effective_world_size = 1
+
+    args.train_batches = IMAGENET_TRAIN_SAMPLES // (args.batch_size * effective_world_size)
+    args.val_batches = IMAGENET_VAL_SAMPLES // (args.batch_size * effective_world_size)
+    args.total_steps = args.epochs * args.train_batches
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
@@ -161,6 +190,67 @@ def main():
 
 def label_to_index(label):
     return int(label) 
+
+
+def soft_target_cross_entropy(output, target):
+    log_probs = torch.nn.functional.log_softmax(output, dim=-1)
+    return -(target * log_probs).sum(dim=-1).mean()
+
+
+def mixup_targets(target, num_classes, lam, device):
+    target_one_hot = torch.nn.functional.one_hot(target, num_classes=num_classes).to(dtype=torch.float32, device=device)
+    target_shuffled = target_one_hot.flip(0)
+    return lam * target_one_hot + (1.0 - lam) * target_shuffled
+
+
+def rand_bbox(size, lam):
+    height = size[-2]
+    width = size[-1]
+    cut_ratio = torch.sqrt(torch.tensor(1.0 - lam, dtype=torch.float32)).item()
+    cut_w = int(width * cut_ratio)
+    cut_h = int(height * cut_ratio)
+
+    cx = random.randint(0, width - 1)
+    cy = random.randint(0, height - 1)
+
+    x1 = max(cx - cut_w // 2, 0)
+    y1 = max(cy - cut_h // 2, 0)
+    x2 = min(cx + cut_w // 2, width)
+    y2 = min(cy + cut_h // 2, height)
+    return x1, y1, x2, y2
+
+
+def apply_mixup_cutmix(images, target, args):
+    if args.mixup_prob <= 0 or random.random() >= args.mixup_prob:
+        return images, target, None
+
+    use_mixup = args.mixup_alpha > 0
+    use_cutmix = args.cutmix_alpha > 0
+    if not use_mixup and not use_cutmix:
+        return images, target, None
+
+    if use_mixup and use_cutmix:
+        apply_cutmix = random.random() < args.switch_prob
+    else:
+        apply_cutmix = use_cutmix
+
+    alpha = args.cutmix_alpha if apply_cutmix else args.mixup_alpha
+    lam = torch.distributions.Beta(alpha, alpha).sample(()).item()
+
+    shuffled_images = images.flip(0)
+    mixed_target = mixup_targets(target, args.num_classes, lam, images.device)
+
+    if apply_cutmix:
+        x1, y1, x2, y2 = rand_bbox(images.size(), lam)
+        images = images.clone()
+        images[:, :, y1:y2, x1:x2] = shuffled_images[:, :, y1:y2, x1:x2]
+        patch_area = (x2 - x1) * (y2 - y1)
+        lam = 1.0 - patch_area / (images.size(-1) * images.size(-2))
+        mixed_target = mixup_targets(target, args.num_classes, lam, images.device)
+    else:
+        images = lam * images + (1.0 - lam) * shuffled_images
+
+    return images, target, mixed_target
 
 def print_peak_memory(prefix, device):
     if device == 0:
@@ -290,8 +380,8 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     if args.dummy:
         print("=> Dummy data is used!")
-        train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
-        val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
+        train_dataset = datasets.FakeData(IMAGENET_TRAIN_SAMPLES, (3, 224, 224), 1000, transforms.ToTensor())
+        val_dataset = datasets.FakeData(IMAGENET_VAL_SAMPLES, (3, 224, 224), 1000, transforms.ToTensor())
     else:
         # traindir = os.path.join(args.data, 'train')
         # valdir = os.path.join(args.data, 'val')
@@ -300,20 +390,44 @@ def main_worker(gpu, ngpus_per_node, args):
 
         world_size = args.world_size if args.distributed else 1
         num_workers = max(1, args.workers) 
-        train_samples_per_worker = 1281167 // (world_size * num_workers)
-        val_samples_per_worker = 50000 // (world_size * num_workers)
+        train_samples_per_worker = IMAGENET_TRAIN_SAMPLES // (world_size * num_workers)
+        val_samples_per_worker = IMAGENET_VAL_SAMPLES // (world_size * num_workers)
+
+        train_transforms = transforms.Compose([
+            transforms.RandomResizedCrop(
+                args.image_size,
+                scale=(0.08, 1.0),
+                interpolation=InterpolationMode.BICUBIC,
+            ),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(
+                num_ops=args.randaugment_num_ops,
+                magnitude=args.randaugment_magnitude,
+                interpolation=InterpolationMode.BICUBIC,
+            ),
+            transforms.ColorJitter(
+                brightness=args.color_jitter,
+                contrast=args.color_jitter,
+                saturation=args.color_jitter,
+                hue=min(0.1, args.color_jitter / 4),
+            ),
+            transforms.ToTensor(),
+            normalize,
+            transforms.RandomErasing(p=args.random_erase_prob, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
+        ])
+        val_transforms = transforms.Compose([
+            transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(args.image_size),
+            transforms.ToTensor(),
+            normalize,
+        ])
 
         train_dataset = wds.WebDataset(args.data + "imagenet1k-train-{0000..1023}.tar",
                                        nodesplitter=wds.split_by_node,
                                        workersplitter=wds.split_by_worker,
                                        shardshuffle=1024).\
             shuffle(1000).decode("pil").to_tuple("jpg", "cls").map_tuple(
-             transforms.Compose([
-                transforms.RandomResizedCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                normalize,
-            ]), label_to_index
+             train_transforms, label_to_index
         ).with_epoch(train_samples_per_worker) 
 
         # train_dataset = datasets.ImageFolder(
@@ -329,12 +443,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                     workersplitter=wds.split_by_worker,
                                     shardshuffle=False).\
             decode("pil").to_tuple("jpg", "cls").map_tuple(
-                transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    normalize,
-                ]), label_to_index
+                val_transforms, label_to_index
             ).with_epoch(val_samples_per_worker) 
         # val_dataset = datasets.ImageFolder(
         #     valdir,
@@ -424,11 +533,8 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
     top1 = AverageMeter('Acc@1', use_accel, ':6.2f', Summary.NONE)
     top5 = AverageMeter('Acc@5', use_accel, ':6.2f', Summary.NONE)
 
-    world_size = args.world_size if args.distributed else 1
-    train_batches = 1281167 // (args.batch_size * world_size)
-
     progress = ProgressMeter(
-        train_batches,
+        args.train_batches,
         [batch_time, data_time, losses, top1, top5],
         prefix="Epoch: [{}]".format(epoch))
 
@@ -439,11 +545,11 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
     for i, (images, target) in enumerate(train_loader):
 
         current_lr = learning_rate_schedule(
-            t=epoch * train_batches + i,
+            t=epoch * args.train_batches + i,
             lr_max=args.lr,
             lr_min=args.min_lr,
             t_warm_up=args.t_warm_up,
-            t_cos_anneal=args.t_cos_anneal,
+            total_steps=args.total_steps,
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = current_lr
@@ -453,15 +559,16 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         # move data to the same device as model
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        images, target, mixed_target = apply_mixup_cutmix(images, target, args)
 
         # compute output
         if args.bf16:
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 output = model(images)
-                loss = criterion(output, target)
+                loss = soft_target_cross_entropy(output, mixed_target) if mixed_target is not None else criterion(output, target)
         else:
             output = model(images)
-            loss = criterion(output, target)
+            loss = soft_target_cross_entropy(output, mixed_target) if mixed_target is not None else criterion(output, target)
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -539,10 +646,8 @@ def validate(val_loader, model, criterion, args):
     top5 = AverageMeter('Acc@5', use_accel, ':6.2f', Summary.AVERAGE)
     
     world_size = args.world_size if args.distributed else 1
-    val_batches = 50000 // (args.batch_size * world_size)
-
     progress = ProgressMeter(
-        val_batches,
+        args.val_batches,
         [batch_time, losses, top1, top5],
         prefix='Test: ')
 
