@@ -10,12 +10,15 @@ module load scicomp-python-env
 
 # 1. Find the hostname of the first node allocated to the job
 MASTER_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-2}
+WORKERS_PER_GPU=8
+TOTAL_WORKERS=$((GPUS_PER_NODE * WORKERS_PER_GPU))
 
 # 2. Use srun and pass SLURM variables to Python
 srun python main.py \
   "/scratch/shareddata/dldata/imagenet-1k-wds/imagenet-1k-wds/" \
   --batch-size 4096 \
-  --workers 16 \
+  --workers "$TOTAL_WORKERS" \
   --epochs 300 \
   --weight-decay 0.3 \
   --lr 3e-3 \
