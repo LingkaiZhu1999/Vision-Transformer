@@ -15,10 +15,20 @@ def image_to_patches(image: torch.Tensor, patch_size: int) -> torch.Tensor:
 	)
 	return patches
 
-def learning_rate_schedule(t, lr_max, lr_min, t_warm_up, t_cos_anneal):
-    if t < t_warm_up:
-        return t / t_warm_up * lr_max
-    elif t >= t_warm_up and t <= t_cos_anneal:
-        return lr_min + 0.5 * (1 + math.cos((t - t_warm_up) / (t_cos_anneal - t_warm_up) * math.pi)) * (lr_max - lr_min)
-    else:
+def learning_rate_schedule(t, lr_max, lr_min, t_warm_up, total_steps):
+    if total_steps <= 0:
         return lr_min
+
+    t = min(t, total_steps)
+    warmup_steps = max(0, min(t_warm_up, total_steps))
+
+    if warmup_steps > 0 and t < warmup_steps:
+        return t / warmup_steps * lr_max
+
+    if t >= total_steps:
+        return lr_min
+
+    cosine_steps = max(1, total_steps - warmup_steps)
+    progress = (t - warmup_steps) / cosine_steps
+    progress = min(max(progress, 0.0), 1.0)
+    return lr_min + 0.5 * (1 + math.cos(progress * math.pi)) * (lr_max - lr_min)
