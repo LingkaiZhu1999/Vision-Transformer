@@ -20,8 +20,10 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
+from torchvision.transforms import v2
 from torchvision.transforms import InterpolationMode
 from torch.optim.lr_scheduler import StepLR
+from torch.utils.data import default_collate
 from torch.utils.data import Subset
 from torch.distributed.optim import ZeroRedundancyOptimizer
 
@@ -87,10 +89,6 @@ parser.add_argument('--mixup-alpha', default=0.8, type=float,
                     help='mixup beta distribution alpha; set 0 to disable')
 parser.add_argument('--cutmix-alpha', default=1.0, type=float,
                     help='cutmix beta distribution alpha; set 0 to disable')
-parser.add_argument('--mixup-prob', default=1.0, type=float,
-                    help='probability of applying mixup/cutmix to a batch')
-parser.add_argument('--switch-prob', default=0.5, type=float,
-                    help='probability of switching from mixup to cutmix when both are enabled')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
@@ -126,6 +124,7 @@ parser.add_argument('--use_zero', action='store_true', help="use zero optimizer 
 best_acc1 = 0
 IMAGENET_TRAIN_SAMPLES = 1281167
 IMAGENET_VAL_SAMPLES = 50000
+NUM_CLASSES = 1000
 
 
 def main():
@@ -190,67 +189,6 @@ def main():
 
 def label_to_index(label):
     return int(label) 
-
-
-def soft_target_cross_entropy(output, target):
-    log_probs = torch.nn.functional.log_softmax(output, dim=-1)
-    return -(target * log_probs).sum(dim=-1).mean()
-
-
-def mixup_targets(target, num_classes, lam, device):
-    target_one_hot = torch.nn.functional.one_hot(target, num_classes=num_classes).to(dtype=torch.float32, device=device)
-    target_shuffled = target_one_hot.flip(0)
-    return lam * target_one_hot + (1.0 - lam) * target_shuffled
-
-
-def rand_bbox(size, lam):
-    height = size[-2]
-    width = size[-1]
-    cut_ratio = torch.sqrt(torch.tensor(1.0 - lam, dtype=torch.float32)).item()
-    cut_w = int(width * cut_ratio)
-    cut_h = int(height * cut_ratio)
-
-    cx = random.randint(0, width - 1)
-    cy = random.randint(0, height - 1)
-
-    x1 = max(cx - cut_w // 2, 0)
-    y1 = max(cy - cut_h // 2, 0)
-    x2 = min(cx + cut_w // 2, width)
-    y2 = min(cy + cut_h // 2, height)
-    return x1, y1, x2, y2
-
-
-def apply_mixup_cutmix(images, target, args):
-    if args.mixup_prob <= 0 or random.random() >= args.mixup_prob:
-        return images, target, None
-
-    use_mixup = args.mixup_alpha > 0
-    use_cutmix = args.cutmix_alpha > 0
-    if not use_mixup and not use_cutmix:
-        return images, target, None
-
-    if use_mixup and use_cutmix:
-        apply_cutmix = random.random() < args.switch_prob
-    else:
-        apply_cutmix = use_cutmix
-
-    alpha = args.cutmix_alpha if apply_cutmix else args.mixup_alpha
-    lam = torch.distributions.Beta(alpha, alpha).sample(()).item()
-
-    shuffled_images = images.flip(0)
-    mixed_target = mixup_targets(target, args.num_classes, lam, images.device)
-
-    if apply_cutmix:
-        x1, y1, x2, y2 = rand_bbox(images.size(), lam)
-        images = images.clone()
-        images[:, :, y1:y2, x1:x2] = shuffled_images[:, :, y1:y2, x1:x2]
-        patch_area = (x2 - x1) * (y2 - y1)
-        lam = 1.0 - patch_area / (images.size(-1) * images.size(-2))
-        mixed_target = mixup_targets(target, args.num_classes, lam, images.device)
-    else:
-        images = lam * images + (1.0 - lam) * shuffled_images
-
-    return images, target, mixed_target
 
 def print_peak_memory(prefix, device):
     if device == 0:
@@ -461,14 +399,24 @@ def main_worker(gpu, ngpus_per_node, args):
     train_sampler = None
     val_sampler = None
 
+    use_mix_augment = args.mixup_alpha > 0 or args.cutmix_alpha > 0
+    if use_mix_augment:
+        cutmix = v2.CutMix(alpha=args.cutmix_alpha, num_classes=NUM_CLASSES)
+        mixup = v2.MixUp(alpha=args.mixup_alpha, num_classes=NUM_CLASSES)
+        cutmix_or_mixup = v2.RandomChoice([cutmix, mixup])
+        def train_collate_fn(batch):
+            return cutmix_or_mixup(*default_collate(batch))
+    else:
+        train_collate_fn = default_collate
+
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, 
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, 
-        drop_last=True, persistent_workers=True)
+        train_dataset, batch_size=args.batch_size,
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler,
+        drop_last=True, persistent_workers=True, collate_fn=train_collate_fn)
 
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, 
-        num_workers=args.workers, pin_memory=True, sampler=val_sampler, 
+        val_dataset, batch_size=args.batch_size,
+        num_workers=args.workers, pin_memory=True, sampler=val_sampler,
         persistent_workers=True)
 
     if args.evaluate:
@@ -480,19 +428,23 @@ def main_worker(gpu, ngpus_per_node, args):
         #     train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        loss, train_acc1, train_acc5, current_lr = train(train_loader, model, criterion, optimizer, epoch, device, args)
+        loss, train_acc1, train_acc5, current_lr = train(
+            train_loader, model, criterion, optimizer, epoch, device, args
+        )
         # evaluate on validation set
         acc1, acc5 = validate(val_loader, model, criterion, args)
         if run is not None:
-            run.log({
+            log_data = {
                 "train/loss": float(loss), 
-                "train/acc1": float(train_acc1), 
-                "train/acc5": float(train_acc5),
                 "train/lr": float(current_lr),
                 "val/acc1": float(acc1), 
                 "val/acc5": float(acc5),
                 "epoch": epoch,
-            })
+            }
+            if train_acc1 is not None and train_acc5 is not None:
+                log_data["train/acc1"] = float(train_acc1)
+                log_data["train/acc5"] = float(train_acc5)
+            run.log(log_data)
 
         # scheduler.step()
         
@@ -526,23 +478,30 @@ def main_worker(gpu, ngpus_per_node, args):
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
     
     use_accel = not args.no_accel and torch.accelerator.is_available()
+    compute_train_accuracy = args.mixup_alpha <= 0 and args.cutmix_alpha <= 0
 
     batch_time = AverageMeter('Time', use_accel, ':6.3f', Summary.NONE)
     data_time = AverageMeter('Data', use_accel, ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', use_accel, ':.4e', Summary.NONE)
-    top1 = AverageMeter('Acc@1', use_accel, ':6.2f', Summary.NONE)
-    top5 = AverageMeter('Acc@5', use_accel, ':6.2f', Summary.NONE)
+    if compute_train_accuracy:
+        top1 = AverageMeter('Acc@1', use_accel, ':6.2f', Summary.NONE)
+        top5 = AverageMeter('Acc@5', use_accel, ':6.2f', Summary.NONE)
+        progress_meters = [batch_time, data_time, losses, top1, top5]
+    else:
+        progress_meters = [batch_time, data_time, losses]
+        top1 = None
+        top5 = None
 
     progress = ProgressMeter(
         args.train_batches,
-        [batch_time, data_time, losses, top1, top5],
+        progress_meters,
         prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    for i, batch in enumerate(train_loader):
 
         current_lr = learning_rate_schedule(
             t=epoch * args.train_batches + i,
@@ -557,24 +516,25 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         data_time.update(time.time() - end)
 
         # move data to the same device as model
+        images, target = batch
+
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
-        images, target, mixed_target = apply_mixup_cutmix(images, target, args)
 
         # compute output
         if args.bf16:
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 output = model(images)
-                loss = soft_target_cross_entropy(output, mixed_target) if mixed_target is not None else criterion(output, target)
+                loss = criterion(output, target)
         else:
             output = model(images)
-            loss = soft_target_cross_entropy(output, mixed_target) if mixed_target is not None else criterion(output, target)
+            loss = criterion(output, target)
 
-        # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        if compute_train_accuracy:
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -590,7 +550,9 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
-    return losses.avg, top1.avg, top5.avg, current_lr
+    if compute_train_accuracy:
+        return losses.avg, top1.avg, top5.avg, current_lr
+    return losses.avg, None, None, current_lr
 
 def validate(val_loader, model, criterion, args):
 
@@ -758,6 +720,7 @@ class ProgressMeter(object):
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
+        
         maxk = max(topk)
         batch_size = target.size(0)
 
