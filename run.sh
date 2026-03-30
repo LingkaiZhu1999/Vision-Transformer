@@ -1,17 +1,19 @@
 #!/bin/bash
-#SBATCH --time=60:00:00
-#SBATCH --mem=180G
+#SBATCH --time=80:00:00
+#SBATCH --mem=200G
 #SBATCH --cpus-per-gpu=40
 #SBATCH --gpus=2
-#SBATCH --ntasks-per-node=1  # <--- Ensures 1 Python command is run per node
-#SBATCH --partition=gpu-h200-141g-ellis
+#SBATCH --partition=gpu-b300-288g-ellis
 
-module load scicomp-python-env
+# module load scicomp-python-env
+source .venv/bin/activate
+module load triton/2025.1-gcc
+module load gcc
 
 # 1. Find the hostname of the first node allocated to the job
 MASTER_NODE=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 GPUS_PER_NODE=${SLURM_GPUS_ON_NODE:-2}
-WORKERS_PER_GPU=8
+WORKERS_PER_GPU=12
 TOTAL_WORKERS=$((GPUS_PER_NODE * WORKERS_PER_GPU))
 
 # 2. Use srun and pass SLURM variables to Python
