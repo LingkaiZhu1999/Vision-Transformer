@@ -52,8 +52,6 @@ parser.add_argument("--d_ff", type=int, default=3072)
 parser.add_argument("--num_classes", type=int, default=1000)
 parser.add_argument("--num_layers", type=int, default=12)
 parser.add_argument("--label_smoothing", type=float, default=0.1)
-parser.add_argument("--early_stopping_patience", type=int, default=15)
-parser.add_argument("--min_delta", type=float, default=5e-4)
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
