@@ -127,6 +127,18 @@ IMAGENET_VAL_SAMPLES = 50000
 NUM_CLASSES = 1000
 
 
+class MixAugmentCollate:
+    """Pickle-safe collate wrapper for mixup/cutmix augmentation."""
+
+    def __init__(self, alpha_cutmix, alpha_mixup, num_classes):
+        cutmix = v2.CutMix(alpha=alpha_cutmix, num_classes=num_classes)
+        mixup = v2.MixUp(alpha=alpha_mixup, num_classes=num_classes)
+        self.transform = v2.RandomChoice([cutmix, mixup])
+
+    def __call__(self, batch):
+        return self.transform(*default_collate(batch))
+
+
 def main():
     args = parser.parse_args()
     if args.seed is not None:
@@ -401,11 +413,11 @@ def main_worker(gpu, ngpus_per_node, args):
 
     use_mix_augment = args.mixup_alpha > 0 or args.cutmix_alpha > 0
     if use_mix_augment:
-        cutmix = v2.CutMix(alpha=args.cutmix_alpha, num_classes=NUM_CLASSES)
-        mixup = v2.MixUp(alpha=args.mixup_alpha, num_classes=NUM_CLASSES)
-        cutmix_or_mixup = v2.RandomChoice([cutmix, mixup])
-        def train_collate_fn(batch):
-            return cutmix_or_mixup(*default_collate(batch))
+        train_collate_fn = MixAugmentCollate(
+            alpha_cutmix=args.cutmix_alpha,
+            alpha_mixup=args.mixup_alpha,
+            num_classes=args.num_classes,
+        )
     else:
         train_collate_fn = default_collate
 
