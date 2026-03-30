@@ -159,15 +159,8 @@ def main():
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
-    if args.multiprocessing_distributed:
-        effective_world_size = torch.accelerator.device_count() * args.world_size
-    elif args.distributed and args.world_size > 0:
-        effective_world_size = args.world_size
-    else:
-        effective_world_size = 1
-
-    args.train_batches = IMAGENET_TRAIN_SAMPLES // (args.batch_size * effective_world_size)
-    args.val_batches = IMAGENET_VAL_SAMPLES // (args.batch_size * effective_world_size)
+    args.train_batches = IMAGENET_TRAIN_SAMPLES // args.batch_size
+    args.val_batches = IMAGENET_VAL_SAMPLES // args.batch_size
     args.total_steps = args.epochs * args.train_batches
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
