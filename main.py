@@ -91,6 +91,14 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--finetune-checkpoint', default='', type=str, metavar='PATH',
+                    help='path to pretrained checkpoint used to initialize fine-tuning')
+parser.add_argument('--reset-head', action='store_true',
+                    help='reinitialize the classification head when loading a fine-tuning checkpoint')
+parser.add_argument('--linear-probe', action='store_true',
+                    help='freeze the backbone and only train the classification head')
+parser.add_argument('--head-lr-mult', default=1.0, type=float,
+                    help='learning-rate multiplier applied to the classifier head during fine-tuning')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -197,6 +205,80 @@ def print_peak_memory(prefix, device):
     if device == 0:
         print(f"{prefix}: {torch.cuda.max_memory_allocated(device) // 1e6}MB ")
 
+
+def unwrap_model(model):
+    if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+        return model.module
+    return model
+
+
+def normalize_state_dict_keys(state_dict):
+    normalized_state_dict = {}
+    for key, value in state_dict.items():
+        normalized_key = key
+        for prefix in ("module.", "_orig_mod."):
+            if normalized_key.startswith(prefix):
+                normalized_key = normalized_key[len(prefix):]
+        normalized_state_dict[normalized_key] = value
+    return normalized_state_dict
+
+
+def load_finetune_checkpoint(model, checkpoint_path, reset_head=False):
+    if not checkpoint_path:
+        return
+
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"No fine-tuning checkpoint found at '{checkpoint_path}'")
+
+    print(f"=> loading fine-tuning checkpoint '{checkpoint_path}'")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    state_dict = normalize_state_dict_keys(state_dict)
+
+    model_to_load = unwrap_model(model)
+    if reset_head:
+        state_dict.pop("head.weight", None)
+        state_dict.pop("head.bias", None)
+
+    incompatible_keys = model_to_load.load_state_dict(state_dict, strict=False)
+    print(
+        "=> fine-tuning checkpoint loaded; "
+        f"missing keys: {list(incompatible_keys.missing_keys)}, "
+        f"unexpected keys: {list(incompatible_keys.unexpected_keys)}"
+    )
+
+
+def configure_trainable_parameters(model, args):
+    model_to_configure = unwrap_model(model)
+
+    if args.linear_probe:
+        print("=> linear probe enabled: freezing backbone and training only the classifier head")
+        for name, parameter in model_to_configure.named_parameters():
+            parameter.requires_grad = name.startswith("head.")
+
+    trainable_parameters = [parameter for parameter in model_to_configure.parameters() if parameter.requires_grad]
+    if not trainable_parameters:
+        raise ValueError("No trainable parameters found. Check fine-tuning freeze settings.")
+
+    head_parameters = []
+    backbone_parameters = []
+    for name, parameter in model_to_configure.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("head."):
+            head_parameters.append(parameter)
+        else:
+            backbone_parameters.append(parameter)
+
+    if args.head_lr_mult != 1.0 and head_parameters:
+        parameter_groups = []
+        if backbone_parameters:
+            parameter_groups.append({"params": backbone_parameters, "lr": args.lr})
+        parameter_groups.append({"params": head_parameters, "lr": args.lr * args.head_lr_mult})
+        return parameter_groups
+
+    return trainable_parameters
+
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
@@ -280,19 +362,23 @@ def main_worker(gpu, ngpus_per_node, args):
     print_peak_memory("Max memory allocated after creating DDP", device)
 
 
+    if args.finetune_checkpoint:
+        load_finetune_checkpoint(model, args.finetune_checkpoint, reset_head=args.reset_head)
+
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
+    optimizer_params = configure_trainable_parameters(model, args)
 
     # optimizer = torch.optim.SGD(model.parameters(), args.lr,
     #                             momentum=args.momentum,
     #                             weight_decay=args.weight_decay)
     if args.use_zero:
-        optimizer = ZeroRedundancyOptimizer(model.parameters(), 
+        optimizer = ZeroRedundancyOptimizer(optimizer_params, 
                     optimizer_class=torch.optim.AdamW, 
                     lr=args.lr, 
                     weight_decay=args.weight_decay)
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = torch.optim.AdamW(optimizer_params, lr=args.lr, weight_decay=args.weight_decay)
     
     # optionally resume from a checkpoint
     if args.resume:
