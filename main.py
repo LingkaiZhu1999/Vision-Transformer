@@ -592,15 +592,18 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
     end = time.time()
     for i, batch in enumerate(train_loader):
 
-        current_lr = learning_rate_schedule(
-            t=epoch * args.train_batches + i,
-            lr_max=args.lr,
-            lr_min=args.min_lr,
-            t_warm_up=args.t_warm_up,
-            total_steps=args.total_steps,
-        )
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = current_lr
+        if not args.finetune_checkpoint:
+            current_lr = learning_rate_schedule(
+                t=epoch * args.train_batches + i,
+                lr_max=args.lr,
+                lr_min=args.min_lr,
+                t_warm_up=args.t_warm_up,
+                total_steps=args.total_steps,
+            )
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = current_lr
+        else:
+            current_lr = args.lr
         # measure data loading time
         data_time.update(time.time() - end)
 
