@@ -640,7 +640,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
+        if i % args.print_freq == 0 and (not args.distributed or (args.distributed and args.rank == 0)):
             progress.display(i + 1)
     if compute_train_accuracy:
         return losses.avg, top1.avg, top5.avg, current_lr
@@ -691,7 +691,7 @@ def validate(val_loader, model, criterion, args):
                 batch_time.update(time.time() - end)
                 end = time.time()
 
-                if i % args.print_freq == 0:
+                if i % args.print_freq == 0 and (not args.distributed or (args.distributed and args.rank == 0)):
                     progress.display(i + 1)
 
     batch_time = AverageMeter('Time', use_accel, ':6.3f', Summary.NONE)
